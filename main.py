@@ -152,7 +152,8 @@ def send_test_push(request: PushTestRequest):
         return {"success": True, "message_id": response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Push failed: {str(e)}")
-    @app.post("/check-reminders")
+    
+@app.post("/check-reminders")
 def check_reminders():
     if not supabase_url or not supabase_service_role_key:
         raise RuntimeError("Supabase credentials are not configured")
