@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from datetime import date
 import os
@@ -8,8 +8,7 @@ import json
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-flash-lite-latest")
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = FastAPI()
 
@@ -37,10 +36,12 @@ Return JSON in this exact format:
 
 If a relative date is mentioned (e.g. "Friday", "tomorrow", "next week"), calculate the actual date based on today's date."""
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=prompt,
+    )
     result_text = response.text.strip()
 
-    # Gemini sometimes wraps JSON in markdown code blocks - strip those
     if result_text.startswith("```"):
         result_text = result_text.split("```")[1]
         if result_text.startswith("json"):
