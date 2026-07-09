@@ -6,8 +6,14 @@ from datetime import date
 import os
 import json
 import requests
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 load_dotenv()
+firebase_creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+if firebase_creds_json:
+    cred = credentials.Certificate(json.loads(firebase_creds_json))
+    firebase_admin.initialize_app(cred)
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 supabase_url = os.getenv("SUPABASE_URL")
@@ -126,3 +132,23 @@ If a relative date is mentioned (e.g. "Friday", "tomorrow", "next week"), calcul
 @app.get("/")
 def health_check():
     return {"status": "backend is running"}
+class PushTestRequest(BaseModel):
+    fcm_token: str
+    title: str = "Test Reminder"
+    body: str = "This is a test push notification"
+
+
+@app.post("/send-test-push")
+def send_test_push(request: PushTestRequest):
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=request.title,
+                body=request.body,
+            ),
+            token=request.fcm_token,
+        )
+        response = messaging.send(message)
+        return {"success": True, "message_id": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Push failed: {str(e)}")
