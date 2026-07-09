@@ -2,7 +2,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from google import genai
 from dotenv import load_dotenv
-from datetime import date
+from datetime import date , datetime
 import os
 import json
 import requests
@@ -152,3 +152,73 @@ def send_test_push(request: PushTestRequest):
         return {"success": True, "message_id": response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Push failed: {str(e)}")
+    @app.post("/check-reminders")
+def check_reminders():
+    if not supabase_url or not supabase_service_role_key:
+        raise RuntimeError("Supabase credentials are not configured")
+
+    now = datetime.utcnow().isoformat()
+
+    # Get due, unnotified tasks
+    response = requests.get(
+        f"{supabase_url}/rest/v1/tasks",
+        params={
+            "select": "id,user_id,title,due_date",
+            "notified": "eq.false",
+            "due_date": f"lte.{now}",
+            "status": "eq.pending",
+        },
+        headers={
+            "apikey": supabase_service_role_key,
+            "Authorization": f"Bearer {supabase_service_role_key}",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    due_tasks = response.json()
+
+    sent_count = 0
+    for task in due_tasks:
+        token_response = requests.get(
+            f"{supabase_url}/rest/v1/device_tokens",
+            params={
+                "select": "fcm_token",
+                "user_id": f"eq.{task['user_id']}",
+            },
+            headers={
+                "apikey": supabase_service_role_key,
+                "Authorization": f"Bearer {supabase_service_role_key}",
+            },
+            timeout=10,
+        )
+        token_response.raise_for_status()
+        tokens = token_response.json()
+
+        for t in tokens:
+            try:
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title="Task Reminder",
+                        body=task["title"],
+                    ),
+                    token=t["fcm_token"],
+                )
+                messaging.send(message)
+                sent_count += 1
+            except Exception as e:
+                print(f"Push failed for token {t['fcm_token']}: {e}")
+
+        # Mark as notified
+        requests.patch(
+            f"{supabase_url}/rest/v1/tasks",
+            params={"id": f"eq.{task['id']}"},
+            json={"notified": True},
+            headers={
+                "apikey": supabase_service_role_key,
+                "Authorization": f"Bearer {supabase_service_role_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+
+    return {"checked": len(due_tasks), "notifications_sent": sent_count}
