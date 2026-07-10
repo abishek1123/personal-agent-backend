@@ -223,3 +223,70 @@ def check_reminders():
         )
 
     return {"checked": len(due_tasks), "notifications_sent": sent_count}
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+    user_id: str
+
+
+def get_recent_tasks(user_id: str) -> list[dict]:
+    if not supabase_url or not supabase_service_role_key:
+        return []
+    response = requests.get(
+        f"{supabase_url}/rest/v1/tasks",
+        params={
+            "select": "title,due_date,status",
+            "user_id": f"eq.{user_id}",
+            "order": "created_at.desc",
+            "limit": 10,
+        },
+        headers={
+            "apikey": supabase_service_role_key,
+            "Authorization": f"Bearer {supabase_service_role_key}",
+        },
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return []
+    return response.json()
+
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    if not request.user_id:
+        raise HTTPException(status_code=401, detail="user_id is required")
+
+    tasks = get_recent_tasks(request.user_id)
+    tasks_summary = "\n".join(
+        f"- {t['title']} (due: {t.get('due_date') or 'no date'}, status: {t['status']})"
+        for t in tasks
+    ) or "No tasks currently."
+
+    system_context = f"""You are a warm, supportive personal companion inside a student's task management app. The student may share how they're feeling, vent about stress, or talk about their day.
+
+Be genuinely warm and present. Keep responses conversational and fairly short (2-4 sentences), like a caring friend, not a therapist giving a lecture. You can reference their tasks below if relevant to what they're saying, but don't force it in.
+
+If they mention something like a low score or a setback, respond with real empathy first, before any advice. If someone seems to be going through something serious or heavy (not just everyday stress), gently encourage them to talk to someone they trust or a counselor, without being alarmist about it.
+
+Their recent tasks:
+{tasks_summary}
+"""
+
+    contents = system_context + "\n\nConversation so far:\n"
+    for m in request.messages:
+        contents += f"{m.role}: {m.content}\n"
+    contents += "assistant:"
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents=contents,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
+
+    return {"reply": response.text.strip()}
