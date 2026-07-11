@@ -8,6 +8,9 @@ import json
 import requests
 import firebase_admin
 from firebase_admin import credentials, messaging
+from fastapi import UploadFile, File, Form
+import pdfplumber
+import io
 
 load_dotenv()
 firebase_creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
@@ -22,6 +25,21 @@ daily_request_limit = int(os.getenv("DAILY_REQUEST_LIMIT", "25"))
 
 app = FastAPI()
 
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return [c.strip() for c in chunks if c.strip()]
+
+def get_embedding(text: str) -> list[float]:
+    result = client.models.embed_content(
+        model="text-embedding-004",
+        contents=text,
+    )
+    return result.embeddings[0].values
 
 class ParseRequest(BaseModel):
     text: str
@@ -290,3 +308,82 @@ Their recent tasks:
         raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
 
     return {"reply": response.text.strip()}
+@app.post("/upload-document")
+async def upload_document(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+):
+    if not user_id:
+        raise HTTPException(status_code=401, detail="user_id is required")
+
+    # Extract text from PDF
+    file_bytes = await file.read()
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            full_text = "\n".join(
+                page.extract_text() or "" for page in pdf.pages
+            )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read PDF: {str(e)}")
+
+    if not full_text.strip():
+        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
+
+    # Create document record
+    doc_response = requests.post(
+        f"{supabase_url}/rest/v1/documents",
+        json={"user_id": user_id, "title": file.filename, "status": "processing"},
+        headers={
+            "apikey": supabase_service_role_key,
+            "Authorization": f"Bearer {supabase_service_role_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        },
+        timeout=10,
+    )
+    doc_response.raise_for_status()
+    document = doc_response.json()[0]
+    document_id = document["id"]
+
+    # Chunk and embed
+    chunks = chunk_text(full_text)
+    chunk_records = []
+    for idx, chunk in enumerate(chunks):
+        try:
+            embedding = get_embedding(chunk)
+            chunk_records.append({
+                "document_id": document_id,
+                "user_id": user_id,
+                "chunk_text": chunk,
+                "chunk_index": idx,
+                "embedding": embedding,
+            })
+        except Exception as e:
+            print(f"Embedding failed for chunk {idx}: {e}")
+
+    if chunk_records:
+        requests.post(
+            f"{supabase_url}/rest/v1/document_chunks",
+            json=chunk_records,
+            headers={
+                "apikey": supabase_service_role_key,
+                "Authorization": f"Bearer {supabase_service_role_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+
+    # Mark document ready
+    requests.patch(
+        f"{supabase_url}/rest/v1/documents",
+        params={"id": f"eq.{document_id}"},
+        json={"status": "ready"},
+        headers={
+            "apikey": supabase_service_role_key,
+            "Authorization": f"Bearer {supabase_service_role_key}",
+            "Content-Type": "application/json",
+        },
+        timeout=10,
+    )
+
+    return {"document_id": document_id, "chunks_created": len(chunk_records)}
