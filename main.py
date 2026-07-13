@@ -387,3 +387,73 @@ async def upload_document(
     )
 
     return {"document_id": document_id, "chunks_created": len(chunk_records)}
+
+
+class AskDocumentRequest(BaseModel):
+    question: str
+    user_id: str
+    document_id: str | None = None
+
+
+@app.post("/ask-document")
+def ask_document(request: AskDocumentRequest):
+    if not request.user_id:
+        raise HTTPException(status_code=401, detail="user_id is required")
+
+    try:
+        query_embedding = get_embedding(request.question)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Embedding request failed: {str(e)}")
+
+    rpc_response = requests.post(
+        f"{supabase_url}/rest/v1/rpc/match_document_chunks",
+        json={
+            "query_embedding": query_embedding,
+            "match_user_id": request.user_id,
+            "match_document_id": request.document_id,
+            "match_count": 5,
+        },
+        headers={
+            "apikey": supabase_service_role_key,
+            "Authorization": f"Bearer {supabase_service_role_key}",
+            "Content-Type": "application/json",
+        },
+        timeout=15,
+    )
+    rpc_response.raise_for_status()
+    matches = rpc_response.json()
+
+    if not matches:
+        return {
+            "answer": "I couldn't find anything relevant in your documents to answer that.",
+            "sources": [],
+        }
+
+    context = "\n\n".join(
+        f"[Chunk {m['chunk_index']}] {m['chunk_text']}" for m in matches
+    )
+
+    prompt = f"""Answer the question using ONLY the context below, which was retrieved from the user's uploaded document(s). If the context doesn't contain enough information to answer, say so honestly instead of guessing.
+
+Context:
+{context}
+
+Question: {request.question}
+
+Answer:"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents=prompt,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
+
+    return {
+        "answer": response.text.strip(),
+        "sources": [
+            {"document_id": m["document_id"], "chunk_index": m["chunk_index"]}
+            for m in matches
+        ],
+    }
