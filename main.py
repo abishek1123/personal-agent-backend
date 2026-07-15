@@ -472,3 +472,225 @@ Answer:"""
             for m in matches
         ],
     }
+
+
+def supabase_headers(json_content: bool = False) -> dict:
+    headers = {
+        "apikey": supabase_service_role_key,
+        "Authorization": f"Bearer {supabase_service_role_key}",
+    }
+    if json_content:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def list_user_documents(user_id: str) -> list[dict]:
+    response = requests.get(
+        f"{supabase_url}/rest/v1/documents",
+        params={
+            "select": "id,title,status",
+            "user_id": f"eq.{user_id}",
+            "status": "eq.ready",
+            "order": "created_at.desc",
+        },
+        headers=supabase_headers(),
+        timeout=10,
+    )
+    if response.status_code != 200:
+        return []
+    return response.json()
+
+
+def fetch_document_chunks(document_id: str, limit: int = 30) -> list[str]:
+    response = requests.get(
+        f"{supabase_url}/rest/v1/document_chunks",
+        params={
+            "select": "chunk_text",
+            "document_id": f"eq.{document_id}",
+            "order": "chunk_index.asc",
+            "limit": limit,
+        },
+        headers=supabase_headers(),
+        timeout=10,
+    )
+    response.raise_for_status()
+    return [row["chunk_text"] for row in response.json()]
+
+
+def insert_task(user_id: str, title: str, raw_input: str, due_date: str | None) -> None:
+    response = requests.post(
+        f"{supabase_url}/rest/v1/tasks",
+        json={
+            "user_id": user_id,
+            "title": title,
+            "raw_input": raw_input,
+            "type": "task",
+            "due_date": due_date,
+            "status": "pending",
+        },
+        headers=supabase_headers(json_content=True),
+        timeout=10,
+    )
+    response.raise_for_status()
+
+
+def generate_text(prompt: str) -> str:
+    try:
+        response = client.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents=prompt,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
+    return response.text.strip()
+
+
+def parse_llm_json(text: str) -> dict | None:
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+@app.post("/assistant")
+def assistant(request: ChatRequest):
+    if not request.user_id:
+        raise HTTPException(status_code=401, detail="user_id is required")
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="messages is required")
+
+    today = date.today().isoformat()
+    current_count = get_usage_count(request.user_id, today)
+    if current_count >= daily_request_limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily request limit of {daily_request_limit} reached",
+        )
+
+    latest = request.messages[-1].content
+    documents = list_user_documents(request.user_id)
+    docs_listing = "\n".join(
+        f'- id: {d["id"]}, title: "{d["title"]}"' for d in documents
+    ) or "(no documents uploaded)"
+
+    intent_prompt = f"""Today's date is {today}. You are the intent router for a student's personal assistant app.
+The user said: "{latest}"
+
+The user's uploaded documents:
+{docs_listing}
+
+Classify the intent and return ONLY valid JSON, no other text, no markdown:
+{{
+  "intent": "add_task" or "ask_documents" or "summarize_document" or "chat",
+  "title": "clean short task title, or null",
+  "due_date": "YYYY-MM-DD or null (resolve relative dates from today)",
+  "document_id": "id of the document the user refers to, or null",
+  "question": "the question to ask over documents, or null"
+}}
+
+Rules:
+- "add_task": user wants to add/remember a task, reminder, or deadline.
+- "summarize_document": user asks to summarize/explain/give overview of one of their documents. Match the document by title, even loosely.
+- "ask_documents": user asks a question whose answer would be in their uploaded documents (mentions a doc, or asks about study material content).
+- "chat": everything else - feelings, greetings, general talk.
+- If the user references a document that doesn't exist in the list, use intent "chat"."""
+
+    parsed = parse_llm_json(generate_text(intent_prompt)) or {"intent": "chat"}
+    intent = parsed.get("intent", "chat")
+
+    save_usage_count(request.user_id, today, current_count + 1)
+
+    if intent == "add_task" and parsed.get("title"):
+        try:
+            insert_task(request.user_id, parsed["title"], latest, parsed.get("due_date"))
+        except Exception:
+            raise HTTPException(status_code=502, detail="Failed to save task")
+        due = parsed.get("due_date")
+        reply = f"Added: {parsed['title']}" + (f", due {due}" if due else "")
+        return {"reply": reply, "intent": intent}
+
+    if intent == "summarize_document" and parsed.get("document_id"):
+        chunks = fetch_document_chunks(parsed["document_id"])
+        if not chunks:
+            return {
+                "reply": "I found that document but it has no readable content to summarize.",
+                "intent": intent,
+            }
+        doc_text = "\n\n".join(chunks)
+        summary = generate_text(
+            f"""Summarize the following document for a student. Be clear and concise:
+start with a 1-2 sentence overview, then the key points as short bullets.
+
+Document:
+{doc_text}
+
+Summary:"""
+        )
+        return {"reply": summary, "intent": intent}
+
+    if intent == "ask_documents":
+        question = parsed.get("question") or latest
+        try:
+            query_embedding = get_embedding(question)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Embedding request failed: {str(e)}")
+        rpc_response = requests.post(
+            f"{supabase_url}/rest/v1/rpc/match_document_chunks",
+            json={
+                "query_embedding": query_embedding,
+                "match_user_id": request.user_id,
+                "match_document_id": parsed.get("document_id"),
+                "match_count": 5,
+            },
+            headers=supabase_headers(json_content=True),
+            timeout=15,
+        )
+        rpc_response.raise_for_status()
+        matches = rpc_response.json()
+        if not matches:
+            return {
+                "reply": "I couldn't find anything relevant in your documents to answer that.",
+                "intent": intent,
+            }
+        context = "\n\n".join(
+            f"[Chunk {m['chunk_index']}] {m['chunk_text']}" for m in matches
+        )
+        answer = generate_text(
+            f"""Answer the question using ONLY the context below, which was retrieved from the user's uploaded document(s). If the context doesn't contain enough information to answer, say so honestly instead of guessing.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+        )
+        return {"reply": answer, "intent": intent}
+
+    # Default: companion chat (same behavior as /chat)
+    tasks = get_recent_tasks(request.user_id)
+    tasks_summary = "\n".join(
+        f"- {t['title']} (due: {t.get('due_date') or 'no date'}, status: {t['status']})"
+        for t in tasks
+    ) or "No tasks currently."
+
+    system_context = f"""You are a warm, supportive personal companion inside a student's task management app. The student may share how they're feeling, vent about stress, or talk about their day.
+
+Be genuinely warm and present. Keep responses conversational and fairly short (2-4 sentences), like a caring friend, not a therapist giving a lecture. You can reference their tasks below if relevant to what they're saying, but don't force it in.
+
+If they mention something like a low score or a setback, respond with real empathy first, before any advice. If someone seems to be going through something serious or heavy (not just everyday stress), gently encourage them to talk to someone they trust or a counselor, without being alarmist about it.
+
+Their recent tasks:
+{tasks_summary}
+"""
+    contents = system_context + "\n\nConversation so far:\n"
+    for m in request.messages:
+        contents += f"{m.role}: {m.content}\n"
+    contents += "assistant:"
+
+    return {"reply": generate_text(contents), "intent": "chat"}
