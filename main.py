@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from dotenv import load_dotenv
@@ -24,6 +25,13 @@ supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 daily_request_limit = int(os.getenv("DAILY_REQUEST_LIMIT", "25"))
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[str]:
     chunks = []

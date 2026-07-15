@@ -9,6 +9,7 @@ returns table (
   id uuid,
   document_id uuid,
   chunk_text text,
+  chunk_index int,
   similarity float
 )
 language sql stable
@@ -17,6 +18,7 @@ as $$
     document_chunks.id,
     document_chunks.document_id,
     document_chunks.chunk_text,
+    document_chunks.chunk_index,
     1 - (document_chunks.embedding <=> query_embedding) as similarity
   from document_chunks
   where document_chunks.user_id = match_user_id
