@@ -372,7 +372,7 @@ async def upload_document(
             print(f"Embedding failed for chunk {idx}: {e}")
 
     if chunk_records:
-        requests.post(
+        chunk_insert_response = requests.post(
             f"{supabase_url}/rest/v1/document_chunks",
             json=chunk_records,
             headers={
@@ -382,6 +382,11 @@ async def upload_document(
             },
             timeout=30,
         )
+        if chunk_insert_response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Storing chunks failed: {chunk_insert_response.status_code} {chunk_insert_response.text}",
+            )
 
     # Mark document ready
     requests.patch(
