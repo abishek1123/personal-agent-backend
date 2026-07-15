@@ -2,6 +2,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from datetime import date , datetime
 import os
@@ -44,8 +45,9 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[st
 
 def get_embedding(text: str) -> list[float]:
     result = client.models.embed_content(
-        model="text-embedding-004",
+        model="gemini-embedding-001",
         contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=768),
     )
     return result.embeddings[0].values
 
