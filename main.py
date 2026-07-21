@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
@@ -11,8 +11,10 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, messaging
 from fastapi import UploadFile, File, Form
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 import pdfplumber
 import io
+import time
 
 load_dotenv()
 firebase_creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
@@ -43,12 +45,46 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[st
         start += chunk_size - overlap
     return [c.strip() for c in chunks if c.strip()]
 
-def get_embedding(text: str) -> list[float]:
-    result = client.models.embed_content(
+# --- Gemini call hardening: retry transient failures with exponential backoff ---
+
+def _is_transient(exc: Exception) -> bool:
+    """Retry on rate-limit / server / network blips (per-minute limits recover
+    quickly). A truly exhausted daily quota will fail after the retries and be
+    surfaced gracefully by the callers."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "429", "500", "502", "503", "504", "rate", "quota", "exhausted",
+        "unavailable", "overloaded", "timeout", "deadline", "connection",
+    ))
+
+
+_gemini_retry = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception(_is_transient),
+    reraise=True,
+)
+
+
+@_gemini_retry
+def _embed(text: str):
+    return client.models.embed_content(
         model="gemini-embedding-001",
         contents=text,
         config=types.EmbedContentConfig(output_dimensionality=768),
     )
+
+
+@_gemini_retry
+def _generate(prompt: str):
+    return client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=prompt,
+    )
+
+
+def get_embedding(text: str) -> list[float]:
+    result = _embed(text)
     return result.embeddings[0].values
 
 class ParseRequest(BaseModel):
@@ -106,20 +142,34 @@ def save_usage_count(user_id: str, usage_date: str, request_count: int) -> None:
     response.raise_for_status()
 
 
+def enforce_rate_limit(user_id: str | None) -> None:
+    """Per-user daily cap on Gemini-backed requests. Checks + increments in one
+    place so every AI endpoint is protected (not just parse-input/assistant).
+    Fails open on a usage-log outage so a transient DB blip never blocks users."""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="user_id is required")
+    today = date.today().isoformat()
+    try:
+        current = get_usage_count(user_id, today)
+    except Exception as e:
+        print(f"Usage check failed (allowing request): {e}")
+        return
+    if current >= daily_request_limit:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You've reached today's limit of {daily_request_limit} requests. Try again tomorrow.",
+        )
+    try:
+        save_usage_count(user_id, today, current + 1)
+    except Exception as e:
+        print(f"Usage save failed (allowing request): {e}")
+
+
 @app.post("/parse-input")
 def parse_input(request: ParseRequest, x_user_id: str | None = Header(default=None)):
     today = date.today().isoformat()
     user_id = resolve_user_id(request, x_user_id)
-
-    if not user_id:
-        raise HTTPException(status_code=401, detail="user_id is required")
-
-    current_count = get_usage_count(user_id, today)
-    if current_count >= daily_request_limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily request limit of {daily_request_limit} reached",
-        )
+    enforce_rate_limit(user_id)
 
     prompt = f"""Today's date is {today}.
 Extract structured info from this input. Return ONLY valid JSON, no other text, no markdown formatting.
@@ -132,27 +182,9 @@ Return JSON in this exact format:
 }}
 If a relative date is mentioned (e.g. "Friday", "tomorrow", "next week"), calculate the actual date based on today's date."""
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=prompt,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
-
-    result_text = response.text.strip()
-    if result_text.startswith("```"):
-        result_text = result_text.split("```")[1]
-        if result_text.startswith("json"):
-            result_text = result_text[4:]
-        result_text = result_text.strip()
-
-    try:
-        parsed = json.loads(result_text)
-    except json.JSONDecodeError:
+    parsed = parse_llm_json(generate_text(prompt))
+    if not parsed:
         parsed = {"type": "task", "title": request.text, "due_date": None}
-
-    save_usage_count(user_id, today, current_count + 1)
 
     return parsed
 
@@ -285,8 +317,7 @@ def get_recent_tasks(user_id: str) -> list[dict]:
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    if not request.user_id:
-        raise HTTPException(status_code=401, detail="user_id is required")
+    enforce_rate_limit(request.user_id)
 
     tasks = get_recent_tasks(request.user_id)
     tasks_summary = "\n".join(
@@ -318,15 +349,83 @@ Their recent tasks:
         raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
 
     return {"reply": response.text.strip()}
+MAX_CHUNKS_PER_DOCUMENT = 300
+
+
+def _set_document_status(document_id: str, status: str) -> None:
+    try:
+        requests.patch(
+            f"{supabase_url}/rest/v1/documents",
+            params={"id": f"eq.{document_id}"},
+            json={"status": status},
+            headers={
+                "apikey": supabase_service_role_key,
+                "Authorization": f"Bearer {supabase_service_role_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Failed to set document {document_id} status={status}: {e}")
+
+
+def process_document_chunks(document_id: str, user_id: str, full_text: str) -> None:
+    """Background job: chunk -> embed -> store, then flip the document status to
+    'ready' or 'failed'. Runs after the upload response is returned so a large
+    PDF never blocks or times out the request. Marking 'failed' (instead of the
+    old always-'ready') means a doc that produced zero chunks no longer looks
+    usable when it isn't."""
+    try:
+        chunks = chunk_text(full_text)[:MAX_CHUNKS_PER_DOCUMENT]
+        chunk_records = []
+        for idx, chunk in enumerate(chunks):
+            try:
+                embedding = get_embedding(chunk)
+                chunk_records.append({
+                    "document_id": document_id,
+                    "user_id": user_id,
+                    "chunk_text": chunk,
+                    "chunk_index": idx,
+                    "embedding": embedding,
+                })
+            except Exception as e:
+                print(f"Embedding failed for chunk {idx}: {e}")
+            time.sleep(0.05)  # gentle pacing so a big doc doesn't burst the rate limit
+
+        if not chunk_records:
+            _set_document_status(document_id, "failed")
+            return
+
+        insert = requests.post(
+            f"{supabase_url}/rest/v1/document_chunks",
+            json=chunk_records,
+            headers={
+                "apikey": supabase_service_role_key,
+                "Authorization": f"Bearer {supabase_service_role_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=60,
+        )
+        if insert.status_code >= 400:
+            print(f"Chunk insert failed: {insert.status_code} {insert.text}")
+            _set_document_status(document_id, "failed")
+            return
+
+        _set_document_status(document_id, "ready")
+    except Exception as e:
+        print(f"Document processing failed for {document_id}: {e}")
+        _set_document_status(document_id, "failed")
+
+
 @app.post("/upload-document")
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user_id: str = Form(...),
 ):
-    if not user_id:
-        raise HTTPException(status_code=401, detail="user_id is required")
+    enforce_rate_limit(user_id)
 
-    # Extract text from PDF
+    # Extract text from the PDF up front (fast); embedding happens in background.
     file_bytes = await file.read()
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -339,7 +438,7 @@ async def upload_document(
     if not full_text.strip():
         raise HTTPException(status_code=400, detail="No extractable text found in PDF")
 
-    # Create document record
+    # Create the document record in 'processing' state.
     doc_response = requests.post(
         f"{supabase_url}/rest/v1/documents",
         json={"user_id": user_id, "title": file.filename, "status": "processing"},
@@ -355,53 +454,10 @@ async def upload_document(
     document = doc_response.json()[0]
     document_id = document["id"]
 
-    # Chunk and embed
-    chunks = chunk_text(full_text)
-    chunk_records = []
-    for idx, chunk in enumerate(chunks):
-        try:
-            embedding = get_embedding(chunk)
-            chunk_records.append({
-                "document_id": document_id,
-                "user_id": user_id,
-                "chunk_text": chunk,
-                "chunk_index": idx,
-                "embedding": embedding,
-            })
-        except Exception as e:
-            print(f"Embedding failed for chunk {idx}: {e}")
+    # Heavy work runs after the response is sent; the app polls status.
+    background_tasks.add_task(process_document_chunks, document_id, user_id, full_text)
 
-    if chunk_records:
-        chunk_insert_response = requests.post(
-            f"{supabase_url}/rest/v1/document_chunks",
-            json=chunk_records,
-            headers={
-                "apikey": supabase_service_role_key,
-                "Authorization": f"Bearer {supabase_service_role_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=30,
-        )
-        if chunk_insert_response.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Storing chunks failed: {chunk_insert_response.status_code} {chunk_insert_response.text}",
-            )
-
-    # Mark document ready
-    requests.patch(
-        f"{supabase_url}/rest/v1/documents",
-        params={"id": f"eq.{document_id}"},
-        json={"status": "ready"},
-        headers={
-            "apikey": supabase_service_role_key,
-            "Authorization": f"Bearer {supabase_service_role_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=10,
-    )
-
-    return {"document_id": document_id, "chunks_created": len(chunk_records)}
+    return {"document_id": document_id, "status": "processing"}
 
 
 class AskDocumentRequest(BaseModel):
@@ -412,31 +468,12 @@ class AskDocumentRequest(BaseModel):
 
 @app.post("/ask-document")
 def ask_document(request: AskDocumentRequest):
-    if not request.user_id:
-        raise HTTPException(status_code=401, detail="user_id is required")
+    enforce_rate_limit(request.user_id)
 
     try:
-        query_embedding = get_embedding(request.question)
+        matches = retrieve_chunks(request.question, request.user_id, request.document_id)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Embedding request failed: {str(e)}")
-
-    rpc_response = requests.post(
-        f"{supabase_url}/rest/v1/rpc/match_document_chunks",
-        json={
-            "query_embedding": query_embedding,
-            "match_user_id": request.user_id,
-            "match_document_id": request.document_id,
-            "match_count": 5,
-        },
-        headers={
-            "apikey": supabase_service_role_key,
-            "Authorization": f"Bearer {supabase_service_role_key}",
-            "Content-Type": "application/json",
-        },
-        timeout=15,
-    )
-    rpc_response.raise_for_status()
-    matches = rpc_response.json()
+        raise HTTPException(status_code=502, detail=f"Retrieval failed: {str(e)}")
 
     if not matches:
         return {
@@ -448,7 +485,8 @@ def ask_document(request: AskDocumentRequest):
         f"[Chunk {m['chunk_index']}] {m['chunk_text']}" for m in matches
     )
 
-    prompt = f"""Answer the question using ONLY the context below, which was retrieved from the user's uploaded document(s). If the context doesn't contain enough information to answer, say so honestly instead of guessing.
+    answer = generate_text(
+        f"""Answer the question using ONLY the context below, which was retrieved from the user's uploaded document(s). If the context doesn't contain enough information to answer, say so honestly instead of guessing.
 
 Context:
 {context}
@@ -456,17 +494,10 @@ Context:
 Question: {request.question}
 
 Answer:"""
-
-    try:
-        response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=prompt,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
+    )
 
     return {
-        "answer": response.text.strip(),
+        "answer": answer,
         "sources": [
             {"document_id": m["document_id"], "chunk_index": m["chunk_index"]}
             for m in matches
@@ -482,6 +513,103 @@ def supabase_headers(json_content: bool = False) -> dict:
     if json_content:
         headers["Content-Type"] = "application/json"
     return headers
+
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval: semantic (vector) + lexical (keyword) search, fused with
+# Reciprocal Rank Fusion, then reranked by an LLM before answer generation.
+# ---------------------------------------------------------------------------
+
+def _vector_search(question: str, user_id: str, document_id: str | None, count: int = 20) -> list[dict]:
+    query_embedding = get_embedding(question)
+    resp = requests.post(
+        f"{supabase_url}/rest/v1/rpc/match_document_chunks",
+        json={
+            "query_embedding": query_embedding,
+            "match_user_id": user_id,
+            "match_document_id": document_id,
+            "match_count": count,
+        },
+        headers=supabase_headers(json_content=True),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _keyword_search(question: str, user_id: str, document_id: str | None, count: int = 20) -> list[dict]:
+    # Degrades gracefully: if the keyword_search_chunks function isn't deployed
+    # yet (migration 004 not run), fall back to vector-only retrieval.
+    try:
+        resp = requests.post(
+            f"{supabase_url}/rest/v1/rpc/keyword_search_chunks",
+            json={
+                "query_text": question,
+                "match_user_id": user_id,
+                "match_document_id": document_id,
+                "match_count": count,
+            },
+            headers=supabase_headers(json_content=True),
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return []
+        return resp.json()
+    except Exception as e:
+        print(f"Keyword search unavailable: {e}")
+        return []
+
+
+def _reciprocal_rank_fusion(result_lists: list[list[dict]], k: int = 60) -> list[dict]:
+    """Fuse multiple ranked lists into one. RRF score for an item is the sum of
+    1/(k + rank) across every list it appears in; k dampens the weight of low
+    ranks. Robust and parameter-light — no per-retriever score tuning needed."""
+    scores: dict = {}
+    meta: dict = {}
+    for results in result_lists:
+        for rank, item in enumerate(results):
+            cid = item["id"]
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+            meta.setdefault(cid, item)
+    return sorted(meta.values(), key=lambda m: scores[m["id"]], reverse=True)
+
+
+def _rerank(question: str, chunks: list[dict], top_n: int = 5) -> list[dict]:
+    """LLM cross-encoder-style rerank: score each candidate's relevance to the
+    question directly, far more precise than embedding similarity. Uses Gemini
+    (no extra dependency/key); a dedicated reranker (e.g. Cohere) can drop in
+    here later if quality needs it."""
+    if len(chunks) <= top_n:
+        return chunks
+    listing = "\n\n".join(f"[{i}] {c['chunk_text']}" for i, c in enumerate(chunks))
+    prompt = f"""Rank the passages by how well they help answer the question.
+Question: {question}
+
+Passages:
+{listing}
+
+Return ONLY a JSON array of the {top_n} most relevant passage numbers, most relevant first. Example: [3, 0, 7, 1, 5]"""
+    order = parse_llm_json(generate_text(prompt))
+    if not isinstance(order, list):
+        return chunks[:top_n]
+    reranked = []
+    for idx in order:
+        if isinstance(idx, int) and 0 <= idx < len(chunks):
+            reranked.append(chunks[idx])
+        if len(reranked) >= top_n:
+            break
+    return reranked or chunks[:top_n]
+
+
+def retrieve_chunks(question: str, user_id: str, document_id: str | None = None, top_n: int = 5) -> list[dict]:
+    """Full hybrid retrieval pipeline. Returns the top_n most relevant chunks,
+    each as {id, document_id, chunk_text, chunk_index}."""
+    vector_results = _vector_search(question, user_id, document_id, count=20)
+    keyword_results = _keyword_search(question, user_id, document_id, count=20)
+    fused = _reciprocal_rank_fusion([vector_results, keyword_results])
+    if not fused:
+        return []
+    return _rerank(question, fused[:12], top_n=top_n)
 
 
 def list_user_documents(user_id: str) -> list[dict]:
@@ -536,12 +664,15 @@ def insert_task(user_id: str, title: str, raw_input: str, due_date: str | None) 
 
 def generate_text(prompt: str) -> str:
     try:
-        response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=prompt,
-        )
+        response = _generate(prompt)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {str(e)}")
+        # Retries exhausted (e.g. quota truly out / Gemini down). Surface a
+        # friendly, retryable signal instead of a raw 500 / stack trace.
+        print(f"LLM generation failed after retries: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="The assistant is busy right now. Please try again in a moment.",
+        )
     return response.text.strip()
 
 
@@ -559,19 +690,11 @@ def parse_llm_json(text: str) -> dict | None:
 
 @app.post("/assistant")
 def assistant(request: ChatRequest):
-    if not request.user_id:
-        raise HTTPException(status_code=401, detail="user_id is required")
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages is required")
+    enforce_rate_limit(request.user_id)
 
     today = date.today().isoformat()
-    current_count = get_usage_count(request.user_id, today)
-    if current_count >= daily_request_limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily request limit of {daily_request_limit} reached",
-        )
-
     latest = request.messages[-1].content
     documents = list_user_documents(request.user_id)
     docs_listing = "\n".join(
@@ -602,8 +725,6 @@ Rules:
 
     parsed = parse_llm_json(generate_text(intent_prompt)) or {"intent": "chat"}
     intent = parsed.get("intent", "chat")
-
-    save_usage_count(request.user_id, today, current_count + 1)
 
     if intent == "add_task" and parsed.get("title"):
         try:
@@ -636,22 +757,9 @@ Summary:"""
     if intent == "ask_documents":
         question = parsed.get("question") or latest
         try:
-            query_embedding = get_embedding(question)
+            matches = retrieve_chunks(question, request.user_id, parsed.get("document_id"))
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Embedding request failed: {str(e)}")
-        rpc_response = requests.post(
-            f"{supabase_url}/rest/v1/rpc/match_document_chunks",
-            json={
-                "query_embedding": query_embedding,
-                "match_user_id": request.user_id,
-                "match_document_id": parsed.get("document_id"),
-                "match_count": 5,
-            },
-            headers=supabase_headers(json_content=True),
-            timeout=15,
-        )
-        rpc_response.raise_for_status()
-        matches = rpc_response.json()
+            raise HTTPException(status_code=502, detail=f"Retrieval failed: {str(e)}")
         if not matches:
             return {
                 "reply": "I couldn't find anything relevant in your documents to answer that.",
